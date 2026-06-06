@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { FilmGrain } from "@/components/mafia/FilmGrain";
 import { RedString } from "@/components/mafia/RedString";
 import { PERSONALITIES, type Personality } from "@/data/personalities";
-import { api, loadGameId } from "@/lib/api";
+import { api, loadGameId, audioUrl } from "@/lib/api";
 
 export const Route = createFileRoute("/discussion")({
   head: () => ({
@@ -43,6 +43,34 @@ function DiscussionPage() {
   const startedRef = useRef(false);
   const pollRef = useRef<number | null>(null);
 
+  // Sequential TTS playback.
+  const audioQueue = useRef<string[]>([]);
+  const enqueued = useRef<Set<string>>(new Set());
+  const playing = useRef(false);
+  const audioEl = useRef<HTMLAudioElement | null>(null);
+
+  const playNext = () => {
+    if (playing.current) return;
+    const url = audioQueue.current.shift();
+    if (!url) return;
+    playing.current = true;
+    const el = audioEl.current || (audioEl.current = new Audio());
+    el.src = url;
+    el.onended = el.onerror = () => { playing.current = false; playNext(); };
+    const p = el.play();
+    if (p && p.catch) p.catch(() => { playing.current = false; });
+  };
+  const enqueueAudio = (url: string | null) => {
+    if (!url || enqueued.current.has(url)) return;
+    enqueued.current.add(url);
+    audioQueue.current.push(url);
+    playNext();
+  };
+
+  // Swap backend "Player_N" mentions for the personality name, to stay consistent.
+  const renamePlayers = (text: string) =>
+    text.replace(/Player_\d+/g, (m) => personaMap.current[m]?.name ?? m);
+
   useEffect(() => {
     const id = loadGameId();
     if (!id) {
@@ -70,19 +98,24 @@ function DiscussionPage() {
             const st = await api.discussionStatus(id);
             const parsed: Line[] = [];
             let curRound = 1;
-            for (const raw of st.discussion) {
-              if (!raw || raw === "WAITING_FOR_HUMAN_INPUT") continue;
+            st.discussion.forEach((raw, i) => {
+              if (!raw || raw === "WAITING_FOR_HUMAN_INPUT") return;
               if (raw.startsWith("---")) {
                 const m = raw.match(/Round (\d+)/);
                 if (m) curRound = parseInt(m[1]);
-                continue;
+                return;
               }
               const idx = raw.indexOf(":");
-              if (idx <= 0) continue;
-              const player = raw.slice(0, idx).trim();
-              const text = raw.slice(idx + 1).trim();
-              parsed.push({ player, persona: personaMap.current[player] ?? null, text, round: curRound });
-            }
+              if (idx <= 0) return;
+              const label = raw.slice(0, idx).trim();
+              const text = renamePlayers(raw.slice(idx + 1).trim());
+              // Backend now labels lines by personality; fall back to the Player_N map.
+              const persona =
+                PERSONALITIES.find((x) => x.id === label) ?? personaMap.current[label] ?? null;
+              parsed.push({ player: label, persona, text, round: curRound });
+              const meta = st.meta?.[i];
+              if (meta?.audio_url) enqueueAudio(audioUrl(meta.audio_url));
+            });
             setLines(parsed);
             if (!st.in_progress) {
               setInProgress(false);
@@ -193,7 +226,7 @@ function ChatLine({ line, typeIt }: { line: Line; typeIt: boolean }) {
         <div className="flex items-baseline gap-3 mb-1">
           <span className="font-display text-sm tracking-[0.2em] text-paper">{label}</span>
           <span className="font-mono text-[10px] uppercase tracking-[0.3em] text-paper/40">
-            {line.player} · Round {line.round}
+            Round {line.round}
           </span>
         </div>
         <p className="font-serif italic text-paper/85 text-base leading-snug min-h-[1.5em]">

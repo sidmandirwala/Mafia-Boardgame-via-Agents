@@ -23,12 +23,13 @@ const ROLE_NOTES: Record<string, string> = {
   Citizen: "No power but the vote. Reason is the only weapon.",
 };
 
+// Dark, readable tones — the card front is light "paper", so light text vanished.
 const ROLE_COLOR: Record<string, string> = {
   Mafia: "text-crimson border-crimson",
   "Bad Guy": "text-crimson border-crimson",
-  Detective: "text-brass border-brass",
-  Doctor: "text-paper border-paper",
-  Citizen: "text-paper/60 border-paper/40",
+  Detective: "text-[#8a6d1b] border-[#8a6d1b]",
+  Doctor: "text-[#1f6b3a] border-[#1f6b3a]",
+  Citizen: "text-[#5a4632] border-[#5a4632]/60",
 };
 
 type Dealt = {

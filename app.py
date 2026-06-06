@@ -253,6 +253,13 @@ PERSONALITIES = {
 # Game state storage
 games = {}
 
+
+def display_name(p):
+    """The label the AI agents see and speak for a player — their personality
+    (unique per game), so dialogue/voice refers to "the Conspirator" rather than
+    "Player_4". Player.name (Player_N) stays the internal identity for targeting."""
+    return getattr(p, "personality", None) or p.name
+
 class Player:
     def __init__(self, name, personality, role=None):
         self.id = str(uuid.uuid4())
@@ -279,7 +286,7 @@ class Player:
             prompt_style = f"You have a unique personality as {self.personality}."
             
         base_prompt = f"""
-    You are playing a fun board game of Mafia with friends. Your name is {self.name} and you have the personality of a {self.personality}.
+    You are playing a fun board game of Mafia with friends. Everyone at the table is known ONLY by their personality archetype — your name is "{self.personality}", and that is how the others address you. You have the personality of a {self.personality}.
     {prompt_style}
 
     Your current role is {self.role}. 
@@ -353,7 +360,7 @@ class Player:
             evil_partner = ""
             for player in game_state["players"]:
                 if player.name != self.name and player.role in ["Mafia", "Bad Guy"]:
-                    evil_partner = player.name
+                    evil_partner = display_name(player)
             role_info += f" You know that {evil_partner} is your evil partner."
         elif self.role == "Detective":
             role_info += " " + self.investigation_note()
@@ -364,8 +371,8 @@ class Player:
         - It is currently {game_state['phase']}
         - You are {self.role}
         - {role_info}
-        - Living players: {', '.join([p.name for p in game_state['players'] if p.alive])}
-        - Dead players: {', '.join([p.name for p in game_state['players'] if not p.alive])}
+        - Living players: {', '.join([display_name(p) for p in game_state['players'] if p.alive])}
+        - Dead players: {', '.join([display_name(p) for p in game_state['players'] if not p.alive])}
 
         Previous game events:
         {game_state['events_log']}
@@ -458,7 +465,9 @@ class Player:
         if not living_players:
             return None
             
-        player_names = [p.name for p in living_players]
+        # Agents see/choose by personality label; map back to Player_N internally.
+        disp_to_name = {display_name(p): p.name for p in living_players}
+        player_names = list(disp_to_name.keys())
         
         # Update night decision prompts in make_night_decision method
         if self.role == "Mafia":
@@ -516,27 +525,29 @@ class Player:
             messages = [SystemMessage(content=prompt)]
             response = strip_reasoning(self.llm.invoke(messages).content)
             
-            # Clean up response to just get the name
-            for player_name in player_names:
-                if player_name.lower() in response.lower():
-                    logger.info(f"Player {self.name} ({self.role}) chose {player_name}")
-                    return player_name
-                    
+            # Match the chosen personality label, return the internal Player_N.
+            for label in player_names:
+                if label.lower() in response.lower():
+                    logger.info(f"Player {self.name} ({self.role}) chose {label}")
+                    return disp_to_name[label]
+
             # If no valid name found, choose randomly
-            random_choice = random.choice(player_names)
+            random_choice = random.choice(list(disp_to_name.values()))
             logger.info(f"Player {self.name} ({self.role}) made invalid choice, randomly selecting {random_choice}")
             return random_choice
-            
+
         except Exception as e:
             logger.error(f"Error in night decision for {self.name}: {str(e)}")
-            return random.choice(player_names)  # Fallback to random choice
+            return random.choice(list(disp_to_name.values()))  # Fallback to random choice
 
     def vote(self, game_state):
         living_players = [p for p in game_state["players"] if p.alive and p.name != self.name]
         if not living_players:
             return None
             
-        player_names = [p.name for p in living_players]
+        # Agents see/choose by personality label; map back to Player_N internally.
+        disp_to_name = {display_name(p): p.name for p in living_players}
+        player_names = list(disp_to_name.keys())
         
         prompt = f"""
         {self.get_base_prompt()}
@@ -563,20 +574,20 @@ class Player:
             messages = [SystemMessage(content=prompt)]
             response = strip_reasoning(self.llm.invoke(messages).content)
             
-            # Clean up response to just get the name
-            for player_name in player_names:
-                if player_name.lower() in response.lower():
-                    logger.info(f"Player {self.name} ({self.role}) voted for {player_name}")
-                    return player_name
-                    
+            # Match the chosen personality label, return the internal Player_N.
+            for label in player_names:
+                if label.lower() in response.lower():
+                    logger.info(f"Player {self.name} ({self.role}) voted for {label}")
+                    return disp_to_name[label]
+
             # If no valid name found, choose randomly
-            random_choice = random.choice(player_names)
+            random_choice = random.choice(list(disp_to_name.values()))
             logger.info(f"Player {self.name} ({self.role}) made invalid vote, randomly selecting {random_choice}")
             return random_choice
-            
+
         except Exception as e:
             logger.error(f"Error in voting for {self.name}: {str(e)}")
-            return random.choice(player_names)  # Fallback to random choice
+            return random.choice(list(disp_to_name.values()))  # Fallback to random choice
 
 class Game:
     def __init__(self, game_id, personalities, has_human_player=False):
@@ -681,9 +692,9 @@ class Game:
                 # in discussion and voting (otherwise the investigation is wasted).
                 detective = next((p for p in self.players if p.role == "Detective" and p.alive), None)
                 if detective:
-                    detective.investigations.append({
+                    detective.investigations.append({  # target shown by personality
                         "round": self.round,
-                        "target": target_player.name,
+                        "target": display_name(target_player),
                         "is_mafia": is_mafia,
                     })
                 
@@ -762,7 +773,7 @@ class Game:
             )
             audio_url = self._save_audio(idx, res.get("audio"))
             self.line_meta[idx] = {
-                "speaker": player.name,
+                "speaker": display_name(player),
                 "emotion": res.get("emotion"),
                 "audio_url": audio_url,
             }
@@ -851,12 +862,12 @@ class Game:
         try:
             response = current_player.generate_response(f"{topic}\n\nPrevious messages:\n{previous_messages}", self.get_state())
             logger.info(f"Response from {current_player.name}: {response[:50]}...")
-            self.discussion_log.append(f"{current_player.name}: {response}")
+            self.discussion_log.append(f"{display_name(current_player)}: {response}")
             # Speak it (tagged reply -> voice) and detect the agent's own emotion.
             self.voice_line(len(self.discussion_log) - 1, current_player)
         except Exception as e:
             logger.error(f"Error getting response from {current_player.name}: {str(e)}")
-            self.discussion_log.append(f"{current_player.name}: I'm thinking about what to say...")
+            self.discussion_log.append(f"{display_name(current_player)}: I'm thinking about what to say...")
 
         # Move to next player
         self.current_speaker_index += 1
@@ -904,7 +915,7 @@ class Game:
                 logger.info(f"Response from {player.name}: {response[:50]}...")
                 
                 # Add response to log
-                message = f"{player.name}: {response}"
+                message = f"{display_name(player)}: {response}"
                 self.discussion_log.append(message)
                 self.voice_line(len(self.discussion_log) - 1, player)
 
@@ -912,7 +923,7 @@ class Game:
                 time.sleep(0.2)
             except Exception as e:
                 logger.error(f"Error getting response from {player.name}: {str(e)}")
-                self.discussion_log.append(f"{player.name}: I'm thinking about what to say...")
+                self.discussion_log.append(f"{display_name(player)}: I'm thinking about what to say...")
                 time.sleep(0.2)
 
         # Continue with next rounds if this round is complete (2 rounds total)
@@ -942,7 +953,7 @@ class Game:
                     logger.info(f"Response from {player.name}: {response[:50]}...")
                     
                     # Add response to log
-                    message = f"{player.name}: {response}"
+                    message = f"{display_name(player)}: {response}"
                     self.discussion_log.append(message)
                     self.voice_line(len(self.discussion_log) - 1, player)
 
@@ -950,7 +961,7 @@ class Game:
                     time.sleep(0.2)
                 except Exception as e:
                     logger.error(f"Error getting response from {player.name}: {str(e)}")
-                    self.discussion_log.append(f"{player.name}: I'm thinking about what to say...")
+                    self.discussion_log.append(f"{display_name(player)}: I'm thinking about what to say...")
                     time.sleep(0.2)
     
     def process_voting(self):
