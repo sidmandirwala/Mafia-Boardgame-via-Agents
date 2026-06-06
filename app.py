@@ -260,6 +260,45 @@ def display_name(p):
     "Player_4". Player.name (Player_N) stays the internal identity for targeting."""
     return getattr(p, "personality", None) or p.name
 
+
+# ===========================================================================
+# DEMO MODE — a fully hardcoded, deterministic single-round playthrough.
+# No K2 calls: roles, night, discussion, and voting are all scripted. ElevenLabs
+# still does real TTS on the scripted lines. The Mafia is caught and exiled in
+# round 1, so the Town wins immediately. This is the `demo` branch's whole point.
+# ===========================================================================
+DEMO_MODE = True
+
+DEMO_CAST = ["Conspirator", "Diplomat", "Empath", "Innocent", "Jester", "Manipulator"]
+DEMO_ROLES = {
+    "Manipulator": "Mafia",     # the villain (only evil -> exiling ends the game)
+    "Empath": "Detective",
+    "Diplomat": "Doctor",
+    "Conspirator": "Citizen",
+    "Innocent": "Citizen",
+    "Jester": "Citizen",
+}
+# Night targets, by personality. Mafia hits the Conspirator, Doctor saves them
+# (no death), Detective investigates and unmasks the Manipulator.
+DEMO_NIGHT = {"mafia": "Conspirator", "doctor": "Conspirator", "detective": "Manipulator"}
+
+# Discussion (round 1). (personality, tagged line). Tags drive TTS delivery and
+# are stripped before display/transcript.
+DEMO_LINES = [
+    ("Empath", "[calm] One of you reeks of guilt. [confident] Manipulator, your smile never reaches your eyes."),
+    ("Manipulator", "[nervous] Me? [angry] You have no proof, only feelings."),
+    ("Conspirator", "[nervous] I was marked for death last night. [confident] The Empath saved me. I believe them."),
+    ("Diplomat", "[confident] The Empath is honest. The Manipulator only deflects."),
+    ("Jester", "[laughs] He's sweating through that coat! [sarcastic] Bad look for an innocent man."),
+    ("Innocent", "[sad] I wanted to trust you. [confident] But my vote goes to the Manipulator."),
+]
+DEMO_VOTE_TARGET = "Manipulator"   # everyone (but the Mafia) votes here
+
+
+def _player_by_personality(game, personality):
+    return next((p for p in game.players if p.personality == personality), None)
+
+
 class Player:
     def __init__(self, name, personality, role=None):
         self.id = str(uuid.uuid4())
@@ -622,6 +661,12 @@ class Game:
         self.assign_roles()
             
     def assign_roles(self):
+        # DEMO: fixed roles by personality (one Mafia, no Bad Guy, scripted).
+        if DEMO_MODE:
+            for player in self.players:
+                player.role = DEMO_ROLES.get(player.personality, "Citizen")
+                logger.info(f"[DEMO] {player.name} = {player.role} ({player.personality})")
+            return
         # Keep the players list in its stable display order (Player_1, Player_2, ...)
         # and shuffle the ROLES instead. Previously the players list was shuffled and
         # roles assigned in a fixed order, so the displayed list was always
@@ -743,6 +788,7 @@ class Game:
     def start_discussion(self):
         self.phase = "discussion"
         self.discussion_log = []
+        self.discussion_complete = False
         return self.get_state()
 
     # ----- Voice / emotion helpers (all best-effort; never break the game) -----
@@ -799,8 +845,25 @@ class Game:
     def simulate_discussion(self, num_rounds=2):
         logger.info(f"Starting discussion for game {self.id}")
         self.discussion_log = []
+
+        # DEMO: stream the scripted lines (one round), each with real ElevenLabs TTS.
+        if DEMO_MODE:
+            self.discussion_log.append("--- Discussion Round 1 ---")
+            for personality, tagged in DEMO_LINES:
+                player = _player_by_personality(self, personality)
+                if not player or not player.alive:
+                    continue
+                player.last_tagged_reply = voice_layer.ensure_tags(tagged)
+                clean = voice_layer.strip_tags(tagged) or "..."
+                self.discussion_log.append(f"{personality}: {clean}")
+                self.voice_line(len(self.discussion_log) - 1, player)  # real TTS
+                time.sleep(0.3)
+            self.discussion_complete = True
+            logger.info("[DEMO] Discussion complete")
+            return
+
         living_players = [p for p in self.players if p.alive]
-        
+
         # Only add the first round header and wait for players to respond in sequence
         round_header = "--- Discussion Round 1 ---"
         self.discussion_log.append(round_header)
@@ -977,27 +1040,37 @@ class Game:
 
         # The human player votes themselves via /human_vote (stored in self.votes);
         # never let the AI vote on their behalf. Use their recorded choice as-is.
-        recorded = getattr(self, "votes", {}) or {}
-        ai_voters = []
-        for p in living_players:
-            if self.has_human_player and p.name == "Player_1":
-                if recorded.get("Player_1"):
-                    vote_map["Player_1"] = recorded["Player_1"]
-                continue
-            ai_voters.append(p)
+        if DEMO_MODE:
+            # Scripted: everyone exiles the Mafia; the Mafia deflects onto the Detective.
+            mafia = _player_by_personality(self, DEMO_VOTE_TARGET)
+            det = _player_by_personality(self, "Empath")
+            for p in living_players:
+                if p.personality == DEMO_VOTE_TARGET:
+                    vote_map[p.name] = det.name if det else (mafia.name if mafia else None)
+                elif mafia:
+                    vote_map[p.name] = mafia.name
+        else:
+            recorded = getattr(self, "votes", {}) or {}
+            ai_voters = []
+            for p in living_players:
+                if self.has_human_player and p.name == "Player_1":
+                    if recorded.get("Player_1"):
+                        vote_map["Player_1"] = recorded["Player_1"]
+                    continue
+                ai_voters.append(p)
 
-        if ai_voters:
-            with ThreadPoolExecutor(max_workers=len(ai_voters)) as ex:
-                futures = {ex.submit(p.vote, state): p for p in ai_voters}
-                for fut in as_completed(futures):
-                    voter = futures[fut]
-                    try:
-                        target = fut.result()
-                    except Exception as e:
-                        logger.error(f"Error getting vote from {voter.name}: {str(e)}")
-                        target = None
-                    if target:
-                        vote_map[voter.name] = target
+            if ai_voters:
+                with ThreadPoolExecutor(max_workers=len(ai_voters)) as ex:
+                    futures = {ex.submit(p.vote, state): p for p in ai_voters}
+                    for fut in as_completed(futures):
+                        voter = futures[fut]
+                        try:
+                            target = fut.result()
+                        except Exception as e:
+                            logger.error(f"Error getting vote from {voter.name}: {str(e)}")
+                            target = None
+                        if target:
+                            vote_map[voter.name] = target
 
         # Tally votes received per target
         tally = {}
@@ -1158,6 +1231,18 @@ def process_night(game_id):
     guard = game_over_response(game)
     if guard:
         return guard
+
+    # DEMO: scripted night targets (by personality), no K2.
+    if DEMO_MODE:
+        def pname(personality):
+            p = _player_by_personality(game, personality)
+            return p.name if p else None
+        game.night_actions["mafia_target"] = pname(DEMO_NIGHT["mafia"])
+        game.night_actions["doctor_target"] = pname(DEMO_NIGHT["doctor"])
+        game.night_actions["detective_target"] = pname(DEMO_NIGHT["detective"])
+        logger.info(f"[DEMO] Night actions: {game.night_actions}")
+        return jsonify({"message": "Night actions processed", "actions": game.night_actions})
+
     state = game.get_state()
 
     # Collect the night decisions that still need an AI choice (skipping dead
@@ -1277,7 +1362,7 @@ def discussion_status(game_id):
     # Calculate progress information
     living_players = [p for p in game.players if p.alive]
     total_players = len(living_players)
-    total_rounds = 2
+    total_rounds = 1 if DEMO_MODE else 2  # demo is a single scripted round
     expected_messages = total_players * total_rounds + total_rounds # Player messages + round headers
     
     # Count messages from each player to track who's "speaking" next
@@ -1309,9 +1394,15 @@ def discussion_status(game_id):
     # Check if discussion is still in progress
     thread_active = any(t.name.startswith("Thread-") and t.is_alive() for t in threading.enumerate())
     waiting_for_human = "WAITING_FOR_HUMAN_INPUT" in discussion
-    
+
+    # DEMO: rely on an explicit completion flag (the scripted run is synchronous,
+    # and the thread_active check is a false positive with Werkzeug worker threads).
+    if DEMO_MODE:
+        in_progress = game.phase == "discussion" and not getattr(game, "discussion_complete", False)
+        progress_percent = 100 if not in_progress else min(
+            99, int((len(discussion) / max(1, expected_messages)) * 100))
     # Determine if discussion is in progress based on thread status and message count
-    if game.phase == "discussion" and (thread_active or len(discussion) < expected_messages or waiting_for_human):
+    elif game.phase == "discussion" and (thread_active or len(discussion) < expected_messages or waiting_for_human):
         in_progress = True
         # Safely calculate progress percentage
         if expected_messages > 0:
@@ -1559,10 +1650,15 @@ def create_game():
     data = request.json
     personalities = data.get('personalities', [])
     is_human_player = data.get('isHumanPlayer', False)
-    
+
+    # DEMO: ignore the picked cast and use the scripted one.
+    if DEMO_MODE:
+        personalities = list(DEMO_CAST)
+        is_human_player = False
+
     # If human player is selected, we need only 5 AI personalities
     required_count = 5 if is_human_player else 6
-    
+
     if len(personalities) != required_count:
         return jsonify({"error": f"Please select exactly {required_count} personalities"}), 400
         
