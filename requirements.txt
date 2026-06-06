@@ -1,0 +1,10 @@
+# Python 3.9 recommended (the langchain 0.0.240 stack does not build on 3.13+).
+flask==2.3.3
+flask-cors==4.0.0
+python-dotenv==1.0.0
+langchain==0.0.240
+langchain-openai==0.0.2
+requests>=2.31
+# Voice / emotion layer (only needed when VOICE_ENABLED=true)
+elevenlabs>=1.0
+valenceai>=1.0
