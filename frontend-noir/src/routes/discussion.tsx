@@ -15,23 +15,14 @@ export const Route = createFileRoute("/discussion")({
   component: DiscussionPage,
 });
 
-type Line = { player: string; persona: Personality | null; text: string; round: number };
-
-function useTypewriter(text: string, speed = 16): { out: string; done: boolean } {
-  const [out, setOut] = useState("");
-  useEffect(() => {
-    setOut("");
-    if (!text) return;
-    let i = 0;
-    const id = window.setInterval(() => {
-      i += 1;
-      setOut(text.slice(0, i));
-      if (i >= text.length) window.clearInterval(id);
-    }, speed);
-    return () => window.clearInterval(id);
-  }, [text, speed]);
-  return { out, done: out.length >= text.length };
-}
+type Line = {
+  player: string;
+  persona: Personality | null;
+  text: string;
+  round: number;
+  audioUrl: string | null; // resolved full URL, or null
+  hasMeta: boolean;        // backend voice step finished for this line
+};
 
 function DiscussionPage() {
   const navigate = useNavigate();
@@ -39,44 +30,49 @@ function DiscussionPage() {
   const [inProgress, setInProgress] = useState(true);
   const [round, setRound] = useState(1);
   const [error, setError] = useState<string | null>(null);
+  // Indices whose audio has actually started playing -> their text may show.
+  const [playedIdx, setPlayedIdx] = useState<Set<number>>(() => new Set());
+  const [tick, setTick] = useState(0); // drives the reveal fallback timer
+
   const personaMap = useRef<Record<string, Personality | null>>({});
   const startedRef = useRef(false);
   const pollRef = useRef<number | null>(null);
+  const firstSeen = useRef<Record<number, number>>({});
 
-  // Sequential TTS playback.
-  const audioQueue = useRef<string[]>([]);
+  // Sequential audio; reveal a line's text on the audio's `playing` event.
+  const audioQueue = useRef<{ url: string; idx: number }[]>([]);
   const enqueued = useRef<Set<string>>(new Set());
-  const playing = useRef(false);
+  const playingRef = useRef(false);
   const audioEl = useRef<HTMLAudioElement | null>(null);
 
+  const reveal = (idx: number) =>
+    setPlayedIdx((prev) => { const s = new Set(prev); s.add(idx); return s; });
+
   const playNext = () => {
-    if (playing.current) return;
-    const url = audioQueue.current.shift();
-    if (!url) return;
-    playing.current = true;
+    if (playingRef.current) return;
+    const item = audioQueue.current.shift();
+    if (!item) return;
+    playingRef.current = true;
     const el = audioEl.current || (audioEl.current = new Audio());
-    el.src = url;
-    el.onended = el.onerror = () => { playing.current = false; playNext(); };
+    el.src = item.url;
+    el.onplaying = () => reveal(item.idx);                 // text appears WITH the voice
+    el.onended = el.onerror = () => { playingRef.current = false; playNext(); };
     const p = el.play();
-    if (p && p.catch) p.catch(() => { playing.current = false; });
+    if (p && p.catch) p.catch(() => { reveal(item.idx); playingRef.current = false; playNext(); });
   };
-  const enqueueAudio = (url: string | null) => {
+  const enqueueAudio = (url: string | null, idx: number) => {
     if (!url || enqueued.current.has(url)) return;
     enqueued.current.add(url);
-    audioQueue.current.push(url);
+    audioQueue.current.push({ url, idx });
     playNext();
   };
 
-  // Swap backend "Player_N" mentions for the personality name, to stay consistent.
   const renamePlayers = (text: string) =>
     text.replace(/Player_\d+/g, (m) => personaMap.current[m]?.name ?? m);
 
   useEffect(() => {
     const id = loadGameId();
-    if (!id) {
-      navigate({ to: "/" });
-      return;
-    }
+    if (!id) { navigate({ to: "/" }); return; }
     if (startedRef.current) return;
     startedRef.current = true;
 
@@ -85,13 +81,11 @@ function DiscussionPage() {
         const gs = await api.gameState(id);
         setRound(gs.round);
         const map: Record<string, Personality | null> = {};
-        gs.players.forEach((p) => {
-          map[p.name] = PERSONALITIES.find((x) => x.id === p.personality) ?? null;
-        });
+        gs.players.forEach((p) => { map[p.name] = PERSONALITIES.find((x) => x.id === p.personality) ?? null; });
         personaMap.current = map;
 
         await api.startDiscussion(id);
-        await api.simulateDiscussion(id); // runs in a background thread on the backend
+        await api.simulateDiscussion(id);
 
         const poll = async () => {
           try {
@@ -105,37 +99,54 @@ function DiscussionPage() {
                 if (m) curRound = parseInt(m[1]);
                 return;
               }
-              const idx = raw.indexOf(":");
-              if (idx <= 0) return;
-              const label = raw.slice(0, idx).trim();
-              const text = renamePlayers(raw.slice(idx + 1).trim());
-              // Backend now labels lines by personality; fall back to the Player_N map.
-              const persona =
-                PERSONALITIES.find((x) => x.id === label) ?? personaMap.current[label] ?? null;
-              parsed.push({ player: label, persona, text, round: curRound });
-              const meta = st.meta?.[i];
-              if (meta?.audio_url) enqueueAudio(audioUrl(meta.audio_url));
+              const ci = raw.indexOf(":");
+              if (ci <= 0) return;
+              const label = raw.slice(0, ci).trim();
+              const text = renamePlayers(raw.slice(ci + 1).trim());
+              const persona = PERSONALITIES.find((x) => x.id === label) ?? personaMap.current[label] ?? null;
+              const meta = st.meta?.[i] ?? null;
+              const idx = parsed.length; // spoken-line index
+              if (firstSeen.current[idx] === undefined) firstSeen.current[idx] = Date.now();
+              if (meta?.audio_url) enqueueAudio(audioUrl(meta.audio_url), idx);
+              parsed.push({ player: label, persona, text, round: curRound, audioUrl: audioUrl(meta?.audio_url ?? null), hasMeta: meta != null });
             });
             setLines(parsed);
             if (!st.in_progress) {
               setInProgress(false);
               if (pollRef.current) window.clearInterval(pollRef.current);
             }
-          } catch {
-            /* transient poll error — keep going */
-          }
+          } catch { /* transient */ }
         };
         await poll();
-        pollRef.current = window.setInterval(poll, 1500);
+        pollRef.current = window.setInterval(poll, 1200);
       } catch (e: any) {
         setError(e?.message || "The table fell silent (backend error).");
       }
     })();
 
-    return () => {
-      if (pollRef.current) window.clearInterval(pollRef.current);
-    };
+    return () => { if (pollRef.current) window.clearInterval(pollRef.current); };
   }, []);
+
+  // Re-evaluate reveal periodically (fallback timer).
+  useEffect(() => {
+    const t = setInterval(() => setTick((x) => x + 1), 600);
+    return () => clearInterval(t);
+  }, []);
+
+  // How many leading lines to show: a line appears once its voice starts. Lines
+  // with no audio (or whose voice is slow >6s) fall back so nothing gets stuck.
+  const now = Date.now();
+  let revealCount = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const ln = lines[i];
+    const waited = now - (firstSeen.current[i] || now) > 6000;
+    if (!ln.hasMeta) { if (waited) { revealCount++; continue; } break; }        // voice synthesizing
+    if (ln.audioUrl && !playedIdx.has(i)) { if (waited) { revealCount++; continue; } break; } // not yet spoken
+    revealCount++;
+  }
+  void tick;
+  const shown = lines.slice(0, revealCount);
+  const stillTalking = inProgress || revealCount < lines.length;
 
   return (
     <div className="min-h-screen bg-ink text-paper relative overflow-hidden">
@@ -164,27 +175,27 @@ function DiscussionPage() {
           </div>
         )}
 
-        {!error && lines.length === 0 && (
+        {!error && shown.length === 0 && (
           <div className="mt-12 flex items-center gap-4 font-mono text-xs uppercase tracking-[0.3em] text-paper/60">
             <span className="inline-block h-3 w-3 rounded-full bg-crimson animate-ping" />
             <span>Gathering the suspects at the table…</span>
           </div>
         )}
 
-        {lines.length > 0 && (
+        {shown.length > 0 && (
           <div className="mt-10 space-y-4">
-            {lines.map((line, i) => (
-              <ChatLine key={`${line.player}-${i}`} line={line} typeIt={i === lines.length - 1} />
+            {shown.map((line, i) => (
+              <ChatLine key={`${line.player}-${i}`} line={line} />
             ))}
 
-            {inProgress && (
+            {stillTalking && (
               <div className="flex items-center gap-3 font-mono text-[10px] uppercase tracking-[0.3em] text-paper/40 pl-[4.5rem]">
                 <span className="inline-block h-2 w-2 rounded-full bg-crimson animate-ping" />
                 someone is talking…
               </div>
             )}
 
-            {!inProgress && (
+            {!stillTalking && (
               <div className="mt-10 flex flex-wrap items-center justify-between gap-4 border-t border-paper/15 pt-6">
                 <span className="font-mono text-[10px] uppercase tracking-[0.3em] text-paper/50">
                   The talking's over. Ballots are on the table.
@@ -204,12 +215,8 @@ function DiscussionPage() {
   );
 }
 
-function ChatLine({ line, typeIt }: { line: Line; typeIt: boolean }) {
-  const { out, done } = useTypewriter(typeIt ? line.text : "");
-  const shown = typeIt ? out : line.text;
-  const isDone = typeIt ? done : true;
+function ChatLine({ line }: { line: Line }) {
   const label = (line.persona?.name ?? line.player).toUpperCase();
-
   return (
     <article className="flex gap-4 animate-[fadeIn_0.4s_ease]">
       {line.persona?.portrait ? (
@@ -225,15 +232,9 @@ function ChatLine({ line, typeIt }: { line: Line; typeIt: boolean }) {
       <div className="flex-1 min-w-0">
         <div className="flex items-baseline gap-3 mb-1">
           <span className="font-display text-sm tracking-[0.2em] text-paper">{label}</span>
-          <span className="font-mono text-[10px] uppercase tracking-[0.3em] text-paper/40">
-            Round {line.round}
-          </span>
+          <span className="font-mono text-[10px] uppercase tracking-[0.3em] text-paper/40">Round {line.round}</span>
         </div>
-        <p className="font-serif italic text-paper/85 text-base leading-snug min-h-[1.5em]">
-          "{shown}
-          {!isDone && <span className="ml-0.5 inline-block w-1.5 h-3 bg-paper/70 align-middle animate-pulse" />}
-          {isDone && '"'}
-        </p>
+        <p className="font-serif italic text-paper/85 text-base leading-snug">"{line.text}"</p>
       </div>
       <style>{`@keyframes fadeIn { from { opacity:0; transform: translateY(4px) } to { opacity:1; transform:none } }`}</style>
     </article>
